@@ -26,7 +26,7 @@ if missing_packages:
 # Configurable parameters
 kChargeComplianceLimit_volts = 4.2
 kDischargeCompianceLimit_volts = 2.5
-kR0PulseCurrent_amps = 10.0
+kR0PulseCurrent_amps = 7 # TODO: Need 10 here, but will exceed 2461 current limit for DC?
 kR0PulseDuration_seconds = 0.0025
 kDcirCurrent_amps = 3.0
 kDcirDuration_seconds = 10.0
@@ -145,26 +145,38 @@ class Keithley2461:
         if self.mock:
             return 3.8 if current > 0 else 3.6 # Mock voltage rise/drop
         
-        # Configure pulse mode
-        self.inst.write(":SOUR:FUNC:SHAP PULS")
-        self.inst.write(":SOUR:FUNC:MODE CURR")
+        # Configure current source mode with voltage measurement
+        self.inst.write(":SOUR:FUNC CURR")
+        self.inst.write(":SENS:FUNC \"VOLT\"")
         self.inst.write(":SENS:VOLT:RANG 20")
-        self.inst.write(f":SOUR:CURR:LEV {current}")
-        self.inst.write(f":SENS:VOLT:PROT {voltage_limit}")
-        self.inst.write("SENS:FUNC \"VOLT\"")
-        self.inst.write(f":SOUR:PULS:WIDT {width}")
-        self.inst.write(f":SOUR:PULS:DEL {delay}")
-
-        # Configure for one pulse
-        self.inst.write(":TRIG:CLE")
-        self.inst.write(":ARM:COUN 1")
-        self.inst.write(":TRIG:COUN 1")
         
-        # :READ? initiates the pulse sequence and returns the measurement.
-        # Pulse mode automatically turns the output on and off.
-        result = self.ParseReading(self.inst.query(":READ?"))['voltage']
+        # Set current range to support the requested current
+        abs_current = abs(current)
+        if abs_current > 7.0:
+            self.inst.write(":SOUR:CURR:RANG 10")  # 10A pulse range
+        else:
+            self.inst.write(":SOUR:CURR:RANG:AUTO ON")
         
-        return result
+        # Set current level and voltage limit
+        self.inst.write(f":SOUR:CURR {current}")
+        self.inst.write(f":SOUR:CURR:VLIM {voltage_limit}")
+        
+        # Optional delay before pulse
+        if delay > 0:
+            time.sleep(delay)
+        
+        # Execute pulse: Turn on, wait for pulse width, measure, turn off
+        self.inst.write(":OUTP ON")
+        time.sleep(width)  # Wait for pulse duration
+        voltage_reading = self.inst.query(":READ?")
+        voltage_value = float(voltage_reading.strip())
+        self.inst.write(":OUTP OFF")
+        
+        # Return to 0A
+        self.inst.write(":SOUR:CURR 0")
+        
+        print(f"   Pulse voltage: {voltage_value:.4f} V")
+        return voltage_value
 
     def test_connection(self):
         """Tests the connection to the instrument by querying its ID."""
@@ -190,29 +202,34 @@ def run_tests(inst, serial_number):
     inst.output_on()
     time.sleep(kVoltageSenseDwell_seconds)
     ocv = inst.measure_voltage()
+    inst.output_off()
     print(f"  OCV: {ocv:.4f} V")
 
-    # # 2. R0 Estimate
-    # print("  Measuring R0...")
-    # # Measure idle voltage for charge
-    # v_idle_charge = inst.measure_voltage()
+    # 2. R0 Estimate
+    print("  Measuring R0...")
+    # Measure idle voltage for charge
+    inst.output_on()
+    v_idle_charge = inst.measure_voltage()
+    inst.output_off()
     
-    # # Charge Pulse
-    # print(f"  Pulsing {kR0PulseCurrent_amps}A for {kR0PulseDuration_seconds}s...")
-    # v_load_charge = inst.source_pulse_current(kR0PulseCurrent_amps, kChargeComplianceLimit_volts, kR0PulseDuration_seconds)
+    # Charge Pulse
+    print(f"  Pulsing {kR0PulseCurrent_amps}A for {kR0PulseDuration_seconds}s...")
+    v_load_charge = inst.source_pulse_current(kR0PulseCurrent_amps, kChargeComplianceLimit_volts, kR0PulseDuration_seconds)
     
-    # # Measure idle voltage for discharge
-    # print("  Measuring OCV...")
-    # v_idle_discharge = inst.measure_voltage()
+    # Measure idle voltage for discharge
+    print("  Measuring OCV...")
+    inst.output_on()
+    v_idle_discharge = inst.measure_voltage()
+    inst.output_off()
 
-    # # Discharge Pulse
-    # print(f"  Pulsing {-kR0PulseCurrent_amps}A for {kR0PulseDuration_seconds}s...")
-    # v_load_discharge = inst.source_pulse_current(-kR0PulseCurrent_amps, kDischargeCompianceLimit_volts, kR0PulseDuration_seconds)
+    # Discharge Pulse
+    print(f"  Pulsing {-kR0PulseCurrent_amps}A for {kR0PulseDuration_seconds}s...")
+    v_load_discharge = inst.source_pulse_current(-kR0PulseCurrent_amps, kDischargeCompianceLimit_volts, kR0PulseDuration_seconds)
 
-    # r_charge = (v_load_charge - v_idle_charge) / kR0PulseCurrent_amps
-    # r_discharge = (v_idle_discharge - v_load_discharge) / kR0PulseCurrent_amps # Delta V / Delta I. Delta I is positive magnitude here.
-    # r0 = (r_charge + r_discharge) / 2.0
-    # print(f"  R0: {r0:.4f} Ohm")
+    r_charge = (v_load_charge - v_idle_charge) / kR0PulseCurrent_amps
+    r_discharge = (v_idle_discharge - v_load_discharge) / kR0PulseCurrent_amps # Delta V / Delta I. Delta I is positive magnitude here.
+    r0 = (r_charge + r_discharge) / 2.0
+    print(f"  R0: {r0:.4f} Ohm")
 
     # # 3. DCIR Test
     # print("  Measuring DCIR...")
