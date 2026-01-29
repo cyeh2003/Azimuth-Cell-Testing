@@ -26,7 +26,7 @@ if missing_packages:
 # Configurable parameters
 kChargeComplianceLimit_volts = 4.2
 kDischargeCompianceLimit_volts = 2.5
-kR0PulseCurrent_amps = 7 # TODO: Need 10 here, but will exceed 2461 current limit for DC?
+kR0PulseCurrent_amps = 1  # TODO: 1A continuous current (to avoid pulsing complexity)
 kR0PulseDuration_seconds = 0.0025
 kDcirCurrent_amps = 3.0
 kDcirDuration_seconds = 10.0
@@ -94,6 +94,10 @@ class Keithley2461:
         if not self.mock:
             self.inst.write(":OUTP OFF")
             self.inst.close()
+            
+    def reset(self):
+        if not self.mock:
+            self.inst.write("*RST")
 
     def output_on(self):
         if not self.mock:
@@ -141,42 +145,101 @@ class Keithley2461:
             self.inst.write(f":SENS:CURR:PROT {current_limit}")
 
     def source_pulse_current(self, current, voltage_limit, width, delay=0):
-        """Executes a current pulse and returns the measured voltage."""
+        """Execute a high-current pulse and return the in-pulse voltage.
+
+        This follows the 2461 manual's pulse-train + digitizer example:
+          - :SOURce:PULSe:TRain:CURRent drives the current pulse
+          - :DIGitize:FUNC \"VOLTage\" digitizes the battery voltage during the pulse
+          - the return value is the average voltage over the pulse plateau
+
+        Args:
+            current: Pulse current in amps (positive = charge, negative = discharge)
+            voltage_limit: Voltage compliance limit in volts
+            width: Pulse width in seconds
+            delay: Optional delay before the pulse in seconds
+        """
         if self.mock:
-            return 3.8 if current > 0 else 3.6 # Mock voltage rise/drop
+            # Simple mock behaviour: slight voltage change under load
+            return 3.8 if current > 0 else 3.6
+
+        inst = self.inst
+
+        # Configure source and digitizer per manual example
+        # SCPI reference (adapted):
+        #   :SOURce:FUNC CURRent
+        #   :SOURce:CURRent:READ:BACK ON
+        #   :DIGitize:FUNC "VOLTage"
+        #   :DIGitize:VOLTage:RSENse ON
+        #   :DIGitize:VOLTage:RANGe 20
+        #   :DIGitize:VOLTage:SRATe 500000
+        inst.write(":SOURce:FUNC CURRent")
+        inst.write(":SOURce:CURRent:READ:BACK ON")
+
+        inst.write(":DIGitize:FUNC \"VOLTage\"")
+        inst.write(":DIGitize:VOLTage:RSENse ON")
+        inst.write(":DIGitize:VOLTage:RANGe 10")
+        inst.write(":DIGitize:VOLTage:SRATe 500000")
+
+        # Prepare digitizer buffer
+        inst.write(":TRACe:POINTS 100000, \"defbuffer1\"")
+
+        # Configure the pulse train:
+        # :SOURce:PULSe:TRain:CURRent
+        #   bias_level, pulse_level, pulse_width, count, measureEnable,
+        #   bufferName, delay, offTime, xBiasLimit, xPulseLimit, failAbort
+        bias_level = 0.0
+        pulse_level = float(current)
+        pulse_width = float(width)
+        count = 1  # single pulse
+        measure_enable = 1  # digitizer enabled
+
+        start_delay = max(0.0, float(delay))
+        off_time = max(0.01, 10.0 * pulse_width)
+
+        x_bias_limit = float(voltage_limit)
+        x_pulse_limit = float(voltage_limit)
+
+        cmd = (
+            f":SOURce:PULSe:TRain:CURRent "
+            f"{bias_level}, {pulse_level}, {pulse_width}, "
+            f"{count}, {measure_enable}, \"defbuffer1\", "
+            f"{start_delay}, {off_time}, "
+            f"{x_bias_limit}, {x_pulse_limit}, 0"
+        )
+        inst.write(cmd)
+        # Calculate expected samples: sample_rate * pulse_width
+        # At 500kS/s, a 2.5ms pulse = 1250 samples
+        sample_rate = 500000
+        expected_samples = int(sample_rate * pulse_width) + 100  # add margin
+
+        # Fire the pulse and wait for completion
+        inst.write(":INIT")
+        # Wait for the operation to complete (pulse + off_time + margin)
+        total_time = start_delay + pulse_width + off_time + 0.5
+        time.sleep(total_time)
         
-        # Configure current source mode with voltage measurement
-        self.inst.write(":SOUR:FUNC CURR")
-        self.inst.write(":SENS:FUNC \"VOLT\"")
-        self.inst.write(":SENS:VOLT:RANG 20")
-        
-        # Set current range to support the requested current
-        abs_current = abs(current)
-        if abs_current > 7.0:
-            self.inst.write(":SOUR:CURR:RANG 10")  # 10A pulse range
-        else:
-            self.inst.write(":SOUR:CURR:RANG:AUTO ON")
-        
-        # Set current level and voltage limit
-        self.inst.write(f":SOUR:CURR {current}")
-        self.inst.write(f":SOUR:CURR:VLIM {voltage_limit}")
-        
-        # Optional delay before pulse
-        if delay > 0:
-            time.sleep(delay)
-        
-        # Execute pulse: Turn on, wait for pulse width, measure, turn off
-        self.inst.write(":OUTP ON")
-        time.sleep(width)  # Wait for pulse duration
-        voltage_reading = self.inst.query(":READ?")
-        voltage_value = float(voltage_reading.strip())
-        self.inst.write(":OUTP OFF")
-        
-        # Return to 0A
-        self.inst.write(":SOUR:CURR 0")
-        
-        print(f"   Pulse voltage: {voltage_value:.4f} V")
-        return voltage_value
+
+        # Read the digitized voltage data
+        inst.write(f":TRACe:DATA? 1, {expected_samples}, \"defbuffer1\", READ")
+        raw = inst.read_raw().decode('ascii').strip()
+       
+        try:
+            samples = [float(s) for s in raw.strip().split(",") if s.strip()]
+        except ValueError:
+            raise RuntimeError(f"Failed to parse digitized voltage data: {raw!r}")
+
+        if not samples:
+            raise RuntimeError("No digitized voltage samples captured during pulse.")
+
+        # Use the central 50 % of samples as the pulse plateau to avoid edges
+        n = len(samples)
+        start = n // 4
+        end = max(start + 1, (3 * n) // 4)
+        plateau = samples[start:end]
+
+        avg_voltage = sum(plateau) / len(plateau)
+        print(f"   Pulse voltage (avg plateau over {len(plateau)} samples): {avg_voltage:.4f} V")
+        return avg_voltage
 
     def test_connection(self):
         """Tests the connection to the instrument by querying its ID."""
@@ -187,7 +250,14 @@ class Keithley2461:
         try:
             idn = self.inst.query("*IDN?")
             self.beep_success()
-            print(f"Connection successful. Instrument ID: {idn.strip()}")
+            idn_parts = idn.strip().split(',')
+            if len(idn_parts) >= 4:
+                print(f"  Manufacturer: {idn_parts[0]}")
+                print(f"  Model:        {idn_parts[1]}")
+                print(f"  Serial:       {idn_parts[2]}")
+                print(f"  Firmware:     {idn_parts[3]}")
+            else:
+                print(f"  Instrument ID: {idn.strip()}")
             return True
         except Exception as e:
             print(f"Connection failed: {e}")
@@ -293,7 +363,6 @@ def main():
     parser.add_argument("--test-connection", action="store_true", help="Test connection to the instrument and exit")
     args = parser.parse_args()
 
-    # Initialize CSV
     # Initialize CSV
     fieldnames = ["Serial Number", "OCV (V)", "R0 (Ohm)", "R0 Charge (Ohm)", "R0 Discharge (Ohm)", "DCIR (Ohm)", "DCIR Charge (Ohm)", "DCIR Discharge (Ohm)"]
     
