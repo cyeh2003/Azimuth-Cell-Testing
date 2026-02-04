@@ -71,8 +71,8 @@ kR0PulseCurrent_amps = 1.0              # Pulse current magnitude [A]
 kR0PulseDuration_seconds = 0.0025       # Pulse width [s] (2.5ms)
 
 # DCIR (DC internal resistance) test parameters
-kDcirCurrent_amps = 1.0                 # DC test current magnitude [A]
-kDcirDuration_seconds = 10.0            # Current application duration [s]
+kDcirCurrent_amps = 1                   # DC test current magnitude [A]
+kDcirDuration_seconds = 5.0             # Current application duration [s]
 
 # Measurement settling time
 kVoltageSenseDwell_seconds = 0.1        # Wait time before voltage reading [s]
@@ -305,6 +305,7 @@ class Keithley2461:
         # Configure as current source measuring voltage
         self.inst.write(":SENS:FUNC 'VOLT'")
         self.inst.write(":SOUR:FUNC CURR")
+        self.inst.write(":SOUR:CURR:RANG:AUTO ON")
         self.inst.write(f":SOUR:CURR:LEV {current}")
         self.inst.write(f":SOUR:CURR:VLIM {voltage_limit}")
 
@@ -477,6 +478,100 @@ class Keithley2461:
             print("  4. Try: pyvisa.ResourceManager('@py').list_resources()")
             print("=" * 50 + "\n")
             return False
+
+
+# =============================================================================
+# CSV Helper Functions
+# =============================================================================
+
+def check_duplicate_serial(csv_path: str, serial_number: str) -> dict | None:
+    """
+    Check if a serial number already exists in the CSV file.
+    
+    Args:
+        csv_path: Path to the CSV file
+        serial_number: Serial number to check for
+        
+    Returns:
+        The existing row as a dictionary if found, None otherwise
+    """
+    try:
+        with open(csv_path, 'r', newline='') as csvfile:
+            reader = csv.DictReader(csvfile)
+            for row in reader:
+                if row.get("Serial Number") == serial_number:
+                    return row
+    except FileNotFoundError:
+        pass  # File doesn't exist yet, no duplicates possible
+    
+    return None
+
+
+def remove_serial_from_csv(csv_path: str, serial_number: str, fieldnames: list):
+    """
+    Remove an entry with the given serial number from the CSV file.
+    
+    Reads all rows, filters out the matching serial number, and rewrites the file.
+    
+    Args:
+        csv_path: Path to the CSV file
+        serial_number: Serial number to remove
+        fieldnames: List of CSV column names for rewriting
+    """
+    rows_to_keep = []
+    
+    try:
+        with open(csv_path, 'r', newline='') as csvfile:
+            reader = csv.DictReader(csvfile)
+            for row in reader:
+                if row.get("Serial Number") != serial_number:
+                    rows_to_keep.append(row)
+    except FileNotFoundError:
+        return  # Nothing to remove
+    
+    # Rewrite the file without the removed entry
+    with open(csv_path, 'w', newline='') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows_to_keep)
+    
+    print(f"[CSV] Removed previous entry for {serial_number}")
+
+
+def prompt_duplicate_action(serial_number: str, existing_data: dict) -> str:
+    """
+    Prompt the user for action when a duplicate serial number is detected.
+    
+    Args:
+        serial_number: The duplicate serial number
+        existing_data: The existing row data from the CSV
+        
+    Returns:
+        User's choice: 'retest', 'skip', or 'rename'
+    """
+    print("\n" + "-" * 60)
+    print(f"DUPLICATE DETECTED: {serial_number}")
+    print("-" * 60)
+    print("\nThis cell already has test results in the output file:")
+    print(f"  OCV  : {float(existing_data.get('OCV (V)', 0)):.4f} V")
+    print(f"  R0   : {float(existing_data.get('R0 (Ohm)', 0))*1000:.2f} mΩ")
+    print(f"  DCIR : {float(existing_data.get('DCIR (Ohm)', 0))*1000:.2f} mΩ")
+    print("\nOptions:")
+    print("  [R] Retest - Test it again! This will OVERWRITE the previous results")
+    print("  [S] Skip   - Cancel and enter a different serial number")
+    print("  [N] New    - This is a DIFFERENT cell, enter a new serial number")
+    
+    while True:
+        choice = input("\nYour choice (R/S/N): ").strip().upper()
+        
+        if choice in ('R', 'RETEST'):
+            return 'retest'
+        elif choice in ('S', 'SKIP'):
+            return 'skip'
+        elif choice in ('N', 'NEW'):
+            return 'rename'
+        else:
+            print("  Invalid choice. Please enter R, S, or N.")
 
 
 # =============================================================================
@@ -755,11 +850,11 @@ def main():
         description="Battery Cell Testing Script for Keithley 2461",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
-  python test_cells.py output.csv                    # Basic usage
-  python test_cells.py output.csv --terminals rear   # Use rear terminals
-  python test_cells.py output.csv --mock             # Test without hardware
-  python test_cells.py output.csv --test-connection  # Verify instrument connection
+            Examples:
+            python test_cells.py output.csv                    # Basic usage
+            python test_cells.py output.csv --terminals rear   # Use rear terminals
+            python test_cells.py output.csv --mock             # Test without hardware
+            python test_cells.py output.csv --test-connection  # Verify instrument connection
         """
     )
     parser.add_argument(
@@ -838,6 +933,37 @@ Examples:
                 if not serial_number:
                     print("  (empty input - please scan barcode or type serial number)")
                     continue
+
+                # Check for duplicate serial number in existing results
+                existing_data = check_duplicate_serial(args.output_csv, serial_number)
+                
+                if existing_data is not None:
+                    action = prompt_duplicate_action(serial_number, existing_data)
+                    
+                    if action == 'skip':
+                        print("\n[SKIP] Test cancelled. Enter a new serial number.\n")
+                        continue
+                    elif action == 'rename':
+                        # Prompt for a new serial number instead
+                        new_serial = input("\nEnter the correct serial number: ").strip()
+                        if not new_serial or new_serial.lower() == 'q':
+                            print("\n[SKIP] Test cancelled.\n")
+                            continue
+                        serial_number = new_serial
+                        
+                        # Check if the new serial is also a duplicate
+                        existing_data = check_duplicate_serial(args.output_csv, serial_number)
+                        if existing_data is not None:
+                            print(f"\n[WARNING] '{serial_number}' also exists in the file!")
+                            action = prompt_duplicate_action(serial_number, existing_data)
+                            if action == 'skip' or action == 'rename':
+                                print("\n[SKIP] Test cancelled. Please start over.\n")
+                                continue
+                            # action == 'retest' falls through to remove and test
+                            
+                    if action == 'retest' or (action == 'rename' and existing_data):
+                        # Remove the old entry before retesting
+                        remove_serial_from_csv(args.output_csv, serial_number, fieldnames)
 
                 # Run test sequence
                 results = run_tests(inst, serial_number)
