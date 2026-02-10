@@ -6,7 +6,8 @@ from typing import List
 
 @dataclass
 class Cell:
-    serial_number: str
+    serial_number: int
+    ocv: float
     dcir: float
     conductance: float
     original_index: int
@@ -33,16 +34,26 @@ def read_cells(file_path: str) -> List[Cell]:
                 if not row or len(row) < 6:
                     continue
                 
-                serial = row[0]
+                try:
+                    serial = int(row[0])
+                except ValueError:
+                    print(f"Warning: skipping row {i+2}, invalid serial number: {row[0]}")
+                    continue
+
+                try:
+                    ocv = float(row[1])
+                except ValueError:
+                    ocv = 0.0
+
                 try:
                     dcir = float(row[5])
                     if dcir <= 0:
-                        print(f"Warning: skipping row {i+2}, non-positive DCIR: {dcir}")
+                        print(f"Warning: skipping cell {serial} (row {i+2}), non-positive DCIR: {dcir}")
                         continue
                     
-                    cells.append(Cell(serial, dcir, 1.0 / dcir, i))
+                    cells.append(Cell(serial, ocv, dcir, 1.0 / dcir, i))
                 except ValueError:
-                    print(f"Warning: skipping row {i+2}, invalid DCIR: {row[5]}")
+                    print(f"Warning: skipping cell {serial} (row {i+2}), invalid DCIR: {row[5]}")
                     continue
     except FileNotFoundError:
         print(f"Error: File not found: {file_path}")
@@ -53,29 +64,80 @@ def read_cells(file_path: str) -> List[Cell]:
         
     return cells
 
-def write_output(file_path: str, modules: List[Module], sort_input: bool):
+def write_output(file_path: str, modules: List[Module], excluded_cells: List[Cell]):
     try:
         with open(file_path, mode='w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
-            writer.writerow(["Module ID", "Serial Number", "Cell DCIR (Ohm)", "Module Parallel DCIR (Ohm)"])
-            
-            # Collect all rows first
-            rows = []
+
+            # ── Per-module sections ──────────────────────────────────
             for mod in modules:
-                mod_res = mod.resistance
-                for cell in mod.cells:
-                    rows.append({
-                        "row": [mod.id, cell.serial_number, f"{cell.dcir:.6f}", f"{mod_res:.6f}"],
-                        "original_index": cell.original_index
-                    })
-            
-            # Sort if requested
-            if sort_input:
-                rows.sort(key=lambda x: x["original_index"])
-            
-            # Write rows
-            for item in rows:
-                writer.writerow(item["row"])
+                sorted_cells = sorted(mod.cells, key=lambda c: c.serial_number)
+
+                # Module header row
+                writer.writerow([
+                    f"--- Module {mod.id} ---",
+                    f"Cells: {len(mod.cells)}",
+                    f"Parallel DCIR: {mod.resistance:.6f} Ohm",
+                ])
+
+                # Column headers
+                writer.writerow(["Serial Number", "DCIR (Ohm)", "OCV (V)"])
+
+                # Cell rows
+                for cell in sorted_cells:
+                    writer.writerow([
+                        cell.serial_number,
+                        f"{cell.dcir:.6f}",
+                        f"{cell.ocv:.6f}",
+                    ])
+
+                # Blank separator between modules
+                writer.writerow([])
+
+            # ── Module summary table ─────────────────────────────────
+            writer.writerow(["=== Module Summary ==="])
+            writer.writerow(["Module", "Parallel DCIR (Ohm)", "Cell Count", "Serial Numbers"])
+
+            for mod in modules:
+                sorted_cells = sorted(mod.cells, key=lambda c: c.serial_number)
+                serials_str = ", ".join(str(c.serial_number) for c in sorted_cells)
+                writer.writerow([
+                    f"Module {mod.id}",
+                    f"{mod.resistance:.6f}",
+                    len(mod.cells),
+                    serials_str,
+                ])
+
+            writer.writerow([])
+
+            # ── Overall statistics ───────────────────────────────────
+            resistances = [m.resistance for m in modules]
+            min_res = min(resistances)
+            max_res = max(resistances)
+            avg_res = sum(resistances) / len(resistances)
+            spread = max_res - min_res
+            pct_spread = (spread / avg_res) * 100 if avg_res > 0 else 0
+
+            writer.writerow(["=== Statistics ==="])
+            writer.writerow(["Metric", "Value"])
+            writer.writerow(["Min Parallel DCIR", f"{min_res:.6f} Ohm"])
+            writer.writerow(["Max Parallel DCIR", f"{max_res:.6f} Ohm"])
+            writer.writerow(["Avg Parallel DCIR", f"{avg_res:.6f} Ohm"])
+            writer.writerow(["Spread", f"{spread:.6f} Ohm ({pct_spread:.4f}%)"])
+            writer.writerow([])
+
+            # ── Excluded cells ───────────────────────────────────────
+            if excluded_cells:
+                excluded_sorted = sorted(excluded_cells, key=lambda c: c.serial_number)
+                writer.writerow([f"=== Excluded Cells ({len(excluded_cells)}) ==="])
+                writer.writerow(["Serial Number", "DCIR (Ohm)", "OCV (V)", "Reason"])
+                for cell in excluded_sorted:
+                    writer.writerow([
+                        cell.serial_number,
+                        f"{cell.dcir:.6f}",
+                        f"{cell.ocv:.6f}",
+                        "Outlier",
+                    ])
 
     except Exception as e:
         print(f"Error writing output: {e}")
@@ -90,6 +152,11 @@ def print_stats(modules: List[Module]):
     percent_diff = (diff / avg_res) * 100 if avg_res > 0 else 0
 
     print("\n--- Module Statistics ---")
+    for mod in modules:
+        sorted_cells = sorted(mod.cells, key=lambda c: c.serial_number)
+        serials = ", ".join(str(c.serial_number) for c in sorted_cells)
+        print(f"  Module {mod.id:>3}: DCIR={mod.resistance:.6f} Ohm  ({len(mod.cells)} cells)  [{serials}]")
+    print()
     print(f"Min Resistance: {min_res:.6f} Ohm")
     print(f"Max Resistance: {max_res:.6f} Ohm")
     print(f"Avg Resistance: {avg_res:.6f} Ohm")
@@ -101,7 +168,6 @@ def main():
     parser.add_argument("--series", type=int, required=True, help="Number of cells in series (number of modules)")
     parser.add_argument("--parallel", type=int, required=True, help="Number of cells in parallel per module")
     parser.add_argument("--output", default="modules.csv", help="Path to output CSV file")
-    parser.add_argument("--sort-input", action="store_true", help="Sort output by original input order instead of by module")
     
     args = parser.parse_args()
 
@@ -120,8 +186,14 @@ def main():
     excess = len(cells) - total_needed
     start_index = excess // 2
     selected_cells = cells[start_index : start_index + total_needed]
+
+    # Track excluded cells (low and high outliers)
+    excluded_low = cells[:start_index]
+    excluded_high = cells[start_index + total_needed:]
+    excluded_cells = excluded_low + excluded_high
     
-    print(f"Selected {len(selected_cells)} cells from {len(cells)} available (skipped {start_index} low and {excess - start_index} high outliers)")
+    print(f"Selected {len(selected_cells)} cells from {len(cells)} available "
+          f"(skipped {len(excluded_low)} low and {len(excluded_high)} high outliers)")
 
     # 3. Grouping Algorithm (Greedy Best-Fit)
     # Sort selected cells by Conductance descending (highest current capability first)
@@ -132,7 +204,6 @@ def main():
     # Distribute cells
     for cell in selected_cells:
         # Find the module with the lowest total conductance that isn't full
-        # We filter for non-full modules, then find min by total_conductance
         eligible_modules = [m for m in modules if len(m.cells) < args.parallel]
         
         if not eligible_modules:
@@ -145,7 +216,7 @@ def main():
         best_module.total_conductance += cell.conductance
 
     # 4. Write Output
-    write_output(args.output, modules, args.sort_input)
+    write_output(args.output, modules, excluded_cells)
     
     # Print stats
     print_stats(modules)
