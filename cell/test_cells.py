@@ -18,7 +18,7 @@ Hardware Requirements:
     - USB connection to the instrument
 
 Usage:
-    python test_cells.py output.csv --terminals front
+    python test_cells.py output.csv
     python test_cells.py output.csv --mock  # For testing without hardware
 """
 
@@ -97,14 +97,13 @@ class Keithley2461:
         >>> smu.close()
     """
     
-    def __init__(self, resource_name: str, mock: bool = False, terminals: str = 'front'):
+    def __init__(self, resource_name: str, mock: bool = False):
         """
         Initialize connection to the Keithley 2461.
         
         Args:
             resource_name: VISA resource string (e.g., "USB0::0x05E6::...::INSTR")
             mock: If True, operate in simulation mode without hardware
-            terminals: Terminal selection - 'front' or 'rear' panel connections
         
         Raises:
             pyvisa.errors.VisaIOError: If connection to instrument fails
@@ -136,10 +135,9 @@ class Keithley2461:
         # This eliminates lead resistance from the measurement
         self.inst.write(":SENS:VOLT:RSEN ON")
         
-        # Select physical terminal connection (front or rear panel)
-        terminal_cmd = "REAR" if terminals.lower() == 'rear' else "FRONT"
-        self.inst.write(f":ROUTe:TERMinals {terminal_cmd}")
-        print(f"       Terminals: {terminal_cmd}")
+        # Use front panel terminals for this setup.
+        self.inst.write(":ROUTe:TERMinals FRONT")
+        print("       Terminals: FRONT")
         
         # Configure as current source with voltage measurement
         self.inst.write(":SOURce:FUNCtion CURRent")
@@ -852,7 +850,6 @@ def main():
         epilog="""
             Examples:
             python test_cells.py output.csv                    # Basic usage
-            python test_cells.py output.csv --terminals rear   # Use rear terminals
             python test_cells.py output.csv --mock             # Test without hardware
             python test_cells.py output.csv --test-connection  # Verify instrument connection
         """
@@ -870,12 +867,6 @@ def main():
         "--mock", 
         action="store_true", 
         help="Run in mock mode without hardware (for testing/development)"
-    )
-    parser.add_argument(
-        "--terminals", 
-        choices=['front', 'rear'], 
-        default='front',
-        help="Select front or rear panel terminals (default: front)"
     )
     parser.add_argument(
         "--test-connection", 
@@ -908,7 +899,7 @@ def main():
     # Initialize instrument
     inst = None
     try:
-        inst = Keithley2461(args.resource, mock=args.mock, terminals=args.terminals)
+        inst = Keithley2461(args.resource, mock=args.mock)
         
         # Handle connection test mode
         if args.test_connection:

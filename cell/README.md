@@ -154,9 +154,6 @@ You should see instrument identification and hear a beep.
 # Basic usage - results saved to output.csv
 python test_cells.py output.csv
 
-# Use rear panel terminals
-python test_cells.py output.csv --terminals rear
-
 # Test without hardware (development/debugging)
 python test_cells.py output.csv --mock
 
